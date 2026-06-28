@@ -1,18 +1,20 @@
 """
-Provenance Guard — Flask API
+Provenance Guard — Flask API + UI
 
 Endpoints:
-  POST /submit  — submit content for attribution analysis
-  POST /appeal  — contest a classification
-  GET  /log     — view structured audit log (most recent entries first)
-  GET  /health  — sanity check
+  GET  /           — serves the web UI
+  POST /submit     — submit content for attribution analysis
+  POST /appeal     — contest a classification
+  GET  /log        — view structured audit log
+  GET  /analytics  — aggregated stats for the dashboard
+  GET  /health     — sanity check
 """
 
 import uuid
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
@@ -20,17 +22,15 @@ import database as db
 import signals as sig
 from labels import generate_label
 
-load_dotenv()  # reads GROQ_API_KEY from .env
+load_dotenv()
 
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
 # Rate Limiter
 # ---------------------------------------------------------------------------
-# Reasoning for chosen limits:
-#   10 per minute  — A human creator submitting their own work won't hit this;
-#                    a script flooding the system will be blocked quickly.
-#   100 per day    — Generous enough for power users; prevents bulk abuse.
+# 10/min  — a human submitting real work never hits this
+# 100/day — generous for power users; blocks bulk scripts
 # ---------------------------------------------------------------------------
 limiter = Limiter(
     get_remote_address,
@@ -39,15 +39,21 @@ limiter = Limiter(
     storage_uri="memory://",
 )
 
-# ---------------------------------------------------------------------------
-# Database init
-# ---------------------------------------------------------------------------
 with app.app_context():
     db.init_db()
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# UI
+# ---------------------------------------------------------------------------
+
+@app.route("/", methods=["GET"])
+def index():
+    return render_template("index.html")
+
+
+# ---------------------------------------------------------------------------
+# API Endpoints
 # ---------------------------------------------------------------------------
 
 @app.route("/health", methods=["GET"])
@@ -62,22 +68,7 @@ def submit():
     Accept a piece of text for attribution analysis.
 
     Request body (JSON):
-      {
-        "text":       "...",        required — the content to analyze
-        "creator_id": "user-123"    required — platform user identifier
-      }
-
-    Response:
-      {
-        "content_id":  "uuid",
-        "attribution": "likely_ai" | "uncertain" | "likely_human",
-        "confidence":  0.0–1.0,
-        "llm_score":   0.0–1.0,
-        "style_score": 0.0–1.0,
-        "label_code":  "likely_ai" | "uncertain" | "likely_human",
-        "label_text":  "verbatim display text",
-        "status":      "classified"
-      }
+      { "text": "...", "creator_id": "user-123" }
     """
     data = request.get_json(silent=True)
     if not data:
@@ -100,25 +91,28 @@ def submit():
     style_result = sig.compute_stylometric_score(text)
     style_score = style_result["style_score"]
 
-    # --- Combine into confidence score ---
-    confidence = sig.combine_scores(llm_score, style_score)
+    # --- Signal 3: AI phrase detector ---
+    phrase_result = sig.detect_ai_phrases(text)
+    phrase_score = phrase_result["phrase_score"]
+
+    # --- Ensemble confidence score (stretch feature: 3 signals) ---
+    confidence = sig.combine_scores(llm_score, style_score, phrase_score)
     attribution = sig.get_attribution(confidence)
 
     # --- Generate transparency label ---
     label = generate_label(confidence, attribution)
 
-    # --- Assign unique content ID ---
     content_id = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    # --- Write to audit log ---
     db.log_submission({
         "content_id":   content_id,
         "creator_id":   creator_id,
         "timestamp":    timestamp,
-        "text_snippet": text[:200],  # store only first 200 chars
+        "text_snippet": text[:200],
         "llm_score":    llm_score,
         "style_score":  style_score,
+        "phrase_score": phrase_score,
         "confidence":   confidence,
         "attribution":  attribution,
         "label_code":   label["label_code"],
@@ -131,11 +125,16 @@ def submit():
         "confidence":  confidence,
         "llm_score":   llm_score,
         "style_score": style_score,
+        "phrase_score": phrase_score,
         "label_code":  label["label_code"],
         "label_text":  label["label_text"],
         "status":      "classified",
-        # include sub-scores for transparency
         "stylometric_breakdown": style_result["sub_scores"],
+        "phrase_breakdown": {
+            "match_count":        phrase_result["match_count"],
+            "tells_per_100_words": phrase_result["tells_per_100_words"],
+            "matched_phrases":    phrase_result["matches"],
+        },
         "llm_reasoning": llm_reasoning,
     })
 
@@ -146,17 +145,7 @@ def appeal():
     Contest a classification.
 
     Request body (JSON):
-      {
-        "content_id":        "uuid",   required
-        "creator_reasoning": "..."     required — the creator's explanation
-      }
-
-    Response:
-      {
-        "content_id": "uuid",
-        "status":     "under_review",
-        "message":    "..."
-      }
+      { "content_id": "uuid", "creator_reasoning": "..." }
     """
     data = request.get_json(silent=True)
     if not data:
@@ -184,9 +173,9 @@ def appeal():
         }), 200
 
     db.log_appeal({
-        "appeal_id":        str(uuid.uuid4()),
-        "content_id":       content_id,
-        "appeal_timestamp": datetime.now(timezone.utc).isoformat(),
+        "appeal_id":         str(uuid.uuid4()),
+        "content_id":        content_id,
+        "appeal_timestamp":  datetime.now(timezone.utc).isoformat(),
         "creator_reasoning": reasoning,
     })
 
@@ -202,30 +191,30 @@ def appeal():
 
 @app.route("/log", methods=["GET"])
 def get_log():
-    """
-    Return the most recent audit log entries as structured JSON.
-
-    Query param:
-      limit — number of entries to return (default 50, max 200)
-    """
+    """Return the most recent audit log entries as structured JSON."""
     try:
         limit = min(int(request.args.get("limit", 50)), 200)
     except ValueError:
         limit = 50
-
     entries = db.get_log(limit=limit)
     return jsonify({"count": len(entries), "entries": entries})
 
 
+@app.route("/analytics", methods=["GET"])
+def analytics():
+    """Return aggregated detection stats for the analytics dashboard."""
+    return jsonify(db.get_analytics())
+
+
 # ---------------------------------------------------------------------------
-# Rate limit error handler
+# Error handlers
 # ---------------------------------------------------------------------------
 
 @app.errorhandler(429)
 def rate_limit_exceeded(e):
     return jsonify({
-        "error": "Rate limit exceeded",
-        "message": str(e.description),
+        "error":       "Rate limit exceeded",
+        "message":     str(e.description),
         "retry_after": "Please wait before submitting again.",
     }), 429
 

@@ -12,6 +12,18 @@ Signal 2 — Stylometric Heuristics (pure Python)
       - Punctuation density        (low density → more AI-like)
     Each sub-metric is normalized and combined into a single score.
     Returns a float 0.0–1.0 (1.0 = very uniform / AI-like patterns).
+
+Signal 3 — AI Phrase Detector (pure Python)
+    Scans for linguistic patterns disproportionately common in AI output:
+      - Transitional boilerplate   ("furthermore", "moreover", "in conclusion")
+      - Hedging phrases            ("it is important to note", "it is worth noting")
+      - Generic AI openers         ("in today's world", "in modern society")
+      - Filler conclusions         ("to summarize", "in essence", "overall")
+    Completely independent of both the LLM call and statistical metrics.
+    Returns a float 0.0–1.0 (1.0 = heavy use of AI-tell phrases).
+
+Ensemble weights (stretch feature):
+    confidence = 0.55 × llm_score + 0.25 × style_score + 0.20 × phrase_score
 """
 
 import json
@@ -206,19 +218,89 @@ def compute_stylometric_score(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Confidence Scorer
+# Signal 3 — AI Phrase Detector
 # ---------------------------------------------------------------------------
 
-def combine_scores(llm_score: float, style_score: float) -> float:
-    """
-    Weighted average of the two signal scores.
+# Patterns that appear disproportionately in AI-generated text.
+# Each is a regex that matches case-insensitively.
+_AI_TELL_PATTERNS = [
+    # Transitional boilerplate
+    r"\bfurthermore\b", r"\bmoreover\b", r"\badditionally\b",
+    r"\bconsequently\b", r"\bnevertheless\b", r"\bnonetheless\b",
+    # Hedging / academic hedges common in AI
+    r"it is important to note", r"it is worth noting", r"it is worth mention",
+    r"it is essential to", r"it is crucial to", r"it is vital to",
+    r"it should be noted", r"one must consider", r"it is imperative",
+    r"it is necessary to",
+    # Generic AI openers
+    r"in today.s world", r"in modern society", r"in recent years",
+    r"in the realm of", r"in the context of", r"in the landscape of",
+    r"in an era of", r"in the age of",
+    # Filler conclusion phrases
+    r"\bin conclusion\b", r"\bto conclude\b", r"\bin summary\b",
+    r"\bto summarize\b", r"\bin essence\b", r"\boverall[,\s]",
+    r"\bin closing\b", r"\bto sum up\b",
+    # AI paragraph starters
+    r"^(first(ly)?|second(ly)?|third(ly)?|finally)[,\s]",
+    r"^it is (also )?worth",
+    # Common AI filler
+    r"\bdelve\b", r"\bunpack\b", r"\bnavigate the complexities\b",
+    r"\btransformative\b", r"\bparadigm shift\b", r"\bholistic(ally)?\b",
+    r"\bleverage\b", r"\bsynergy\b", r"\bstakeholder",
+]
 
-    LLM gets 60% weight: it captures semantic nuance that heuristics miss.
-    Stylometric gets 40% weight: fast, interpretable, independent of the LLM.
+_COMPILED_TELLS = [re.compile(p, re.IGNORECASE | re.MULTILINE) for p in _AI_TELL_PATTERNS]
+
+
+def detect_ai_phrases(text: str) -> dict:
+    """
+    Scan text for AI-tell phrases and return a normalized score.
+
+    Returns:
+        {
+          "phrase_score": float 0.0–1.0,
+          "matches": list of matched phrases,
+          "match_count": int,
+          "tells_per_100_words": float
+        }
+    """
+    matches = []
+    for pattern in _COMPILED_TELLS:
+        found = pattern.findall(text)
+        if found:
+            matches.extend(found)
+
+    word_count = max(len(text.split()), 1)
+    tells_per_100 = (len(matches) / word_count) * 100
+
+    # Saturates at 3 tells per 100 words → score 1.0
+    # A single tell in a 100-word passage → score ~0.33
+    score = min(tells_per_100 / 3.0, 1.0)
+
+    return {
+        "phrase_score": round(score, 4),
+        "matches": list(set(m.strip().lower() for m in matches))[:10],
+        "match_count": len(matches),
+        "tells_per_100_words": round(tells_per_100, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ensemble Confidence Scorer (stretch feature: 3 signals)
+# ---------------------------------------------------------------------------
+
+def combine_scores(llm_score: float, style_score: float, phrase_score: float = 0.0) -> float:
+    """
+    Weighted ensemble of three independent signals.
+
+    Weights:
+      LLM classifier   55% — best at semantic context
+      Stylometrics     25% — structural / statistical patterns
+      AI phrase detect 20% — explicit linguistic tells
 
     Returns a float 0.0–1.0 (1.0 = high confidence of AI generation).
     """
-    confidence = (0.60 * llm_score) + (0.40 * style_score)
+    confidence = (0.55 * llm_score) + (0.25 * style_score) + (0.20 * phrase_score)
     return round(confidence, 4)
 
 

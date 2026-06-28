@@ -274,6 +274,39 @@ stylometric signal less weight for content detected as poetry-like.
 
 ---
 
+## Stretch Features Implemented
+
+### 1. Ensemble Detection (3+ signals)
+
+Added **Signal 3 — AI Phrase Detector** (pure Python, no API call):
+- Scans for 30+ regex patterns disproportionately common in AI output
+- Categories: transitional boilerplate ("furthermore", "moreover"), hedging phrases
+  ("it is important to note"), generic openers ("in modern society"), conclusion fillers
+  ("in summary", "to conclude"), and common AI vocabulary ("transformative", "delve",
+  "paradigm shift", "stakeholder")
+- Score = min(tells_per_100_words / 3.0, 1.0)
+- Ensemble weights updated: 55% LLM, 25% stylometrics, 20% phrase detector
+
+### 2. Analytics Dashboard
+
+`GET /analytics` returns:
+- Total submissions, attribution breakdown, appeal rate
+- Average signal scores (llm, style, phrase, overall confidence)
+- 5 most recent submissions
+
+Visible in the UI under the **Analytics** tab.
+
+### 3. Web UI
+
+Single-page interface served at `GET /` by Flask:
+- Submission form with real-time results
+- Circular confidence gauge (SVG, color-coded by attribution)
+- Three signal bars (LLM, Stylometrics, Phrase Detector)
+- Verbatim transparency label text
+- In-page appeal form
+- Audit Log tab with all submission/appeal entries
+- Analytics tab with breakdown charts and average signal scores
+
 ## AI Tool Plan
 
 ### Milestone 3 — Submission endpoint + first signal (LLM)
